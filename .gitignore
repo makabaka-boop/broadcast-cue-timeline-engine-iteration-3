@@ -1,0 +1,19 @@
+# Python 本地产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# SQLite 挂载卷与本地回退数据
+/data/
+/local-data/
+*.db
+*.db-wal
+*.db-shm
+
+# 系统/编辑器
+.DS_Store
+.idea/
+.vscode/

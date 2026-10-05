@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: broadcast-cue-api:latest
+    container_name: broadcast-cue-api
+    ports:
+      # 仅绑定本地回环，开放本地 HTTP 入口 http://127.0.0.1:8000
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # SQLite 数据库保存在挂载卷（宿主 ./data -> 容器 /data）
+      - ./data:/data
+    environment:
+      BROADCAST_DB_PATH: /data/app.db
+    restart: unless-stopped
