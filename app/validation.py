@@ -190,7 +190,7 @@ def validate_delay(payload, canonical_template):
         raise AppError(INVALID_DELAY, "Delay override must be a JSON object.",
                        status_code=400)
 
-    allowed_top = {"template_id", "delay", "explain"}
+    allowed_top = {"template_id", "delay", "explain", "bind"}
     extra = set(payload) - allowed_top
     if extra:
         raise AppError(
@@ -237,3 +237,48 @@ def validate_delay(payload, canonical_template):
         delay[key] = value
 
     return delay
+
+
+def validate_bind(payload, canonical_template):
+    """校验推演请求中可选的"同刻绑定"，返回规范化点对或 ``None``。
+
+    绑定必须是恰好两个**互不相同**的已知点 ID；与录入次序无关，统一
+    规范化为按 ID 升序的 ``[a, b]``。非法情形一律报 ``invalid_delay``
+    （推演请求的稳定校验错误码），不落库、不推演。
+    """
+    raw = payload.get("bind")
+    if raw is None:
+        return None
+
+    if not isinstance(raw, list):
+        raise AppError(
+            INVALID_DELAY,
+            "Field 'bind' must be an array of exactly two point ids.",
+            status_code=400, details={"path": "bind"})
+    if len(raw) != 2:
+        raise AppError(
+            INVALID_DELAY,
+            "Field 'bind' must contain exactly two point ids.",
+            status_code=400,
+            details={"path": "bind", "count": len(raw)})
+
+    point_ids = {p["id"] for p in canonical_template["points"]}
+    bind = []
+    for index, pid in enumerate(raw):
+        if not _is_non_empty_str(pid) or pid not in point_ids:
+            raise AppError(
+                INVALID_DELAY,
+                f"bind[{index}] {pid!r} is not an existing point id.",
+                status_code=400,
+                details={"path": f"bind[{index}]", "id": pid})
+        bind.append(pid)
+
+    if bind[0] == bind[1]:
+        raise AppError(
+            INVALID_DELAY,
+            "Field 'bind' must reference two distinct point ids.",
+            status_code=400,
+            details={"path": "bind", "id": bind[0]})
+
+    bind.sort()
+    return bind
