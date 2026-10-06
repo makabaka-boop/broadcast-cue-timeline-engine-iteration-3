@@ -12,7 +12,7 @@ from .errors import (AppError, DEADLINE_EXCEEDED, INVALID_REQUEST,
 from .scheduler import (STATUS_DEADLINE_EXCEEDED, STATUS_OK,
                         STATUS_POSITIVE_CYCLE, earliest_schedule,
                         explain_schedule, verify_result_explanations)
-from .validation import validate_delay, validate_template
+from .validation import validate_derivation, validate_template
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -69,16 +69,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 f"Template {template_id!r} does not exist.",
                 status_code=404, details={"template_id": template_id})
 
-        delay = validate_delay(payload, template)
-        # explain 已在 validate_delay 中校验为布尔（缺省 False）。
+        delay, bind = validate_derivation(payload, template)
+        # explain 已在 validate_derivation 中校验为布尔（缺省 False）。
         want_explain = payload.get("explain", False)
 
         if want_explain:
             outcome = explain_schedule(template["points"],
-                                       template["relations"], delay)
+                                       template["relations"], delay, bind)
         else:
             outcome = earliest_schedule(template["points"],
-                                        template["relations"], delay)
+                                        template["relations"], delay, bind)
 
         if outcome["status"] == STATUS_POSITIVE_CYCLE:
             # 正权环永远优先报原错误：不落库、不附解释、不触碰既有数据。
@@ -102,7 +102,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
         assert outcome["status"] == STATUS_OK
         times = outcome["times"]
         result_id, created_at = await run_in_threadpool(
-            db.insert_result, template_id, delay, times, _db_path(request))
+            db.insert_result, template_id, delay, times,
+            _db_path(request), bind)
         body = {
             "result_id": result_id,
             "template_id": template_id,
@@ -111,6 +112,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "times": _sorted_times(template["points"], times),
             "points": _schedule_points(template["points"], times),
         }
+        if bind is not None:
+            # 冻结的规范化绑定（两点 ID 升序）；未传绑定时字段缺省，
+            # 与旧版响应逐项兼容。
+            body["bind"] = list(bind)
         if want_explain:
             # 解释只随响应给出，不落库；读取时按冻结模板 + delay 重算。
             body["explanations"] = outcome["explanations"]
@@ -131,6 +136,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             db.get_template, record["template_id"], _db_path(request))
         # results.template_id 有外键约束，模板必然存在。
         points = template["points"]
+        bind = record.get("bind")
         body = {
             "result_id": record["id"],
             "template_id": record["template_id"],
@@ -139,12 +145,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "times": _sorted_times(points, record["times"]),
             "points": _schedule_points(points, record["times"]),
         }
+        if bind is not None:
+            body["bind"] = list(bind)
         if want_explain:
-            # 解释不落库：由冻结模板 + delay 重算，并与保存的结果逐点核对；
-            # 不一致时明确报错，记录保持原样、绝不改写。
+            # 解释不落库：由冻结模板 + delay + 同刻绑定重算，并与保存的
+            # 结果逐点核对；不一致时明确报错，记录保持原样、绝不改写。
             check = verify_result_explanations(
                 points, template["relations"], record["delay"],
-                record["times"])
+                record["times"], bind)
             if check["status"] != STATUS_OK:
                 raise AppError(
                     RESULT_INCONSISTENT,

@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS results (
     id           TEXT PRIMARY KEY,
     template_id  TEXT NOT NULL,
     delay_json   TEXT NOT NULL,
+    bind_json    TEXT,
     times_json   TEXT NOT NULL,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     FOREIGN KEY (template_id) REFERENCES templates(id)
@@ -73,6 +74,12 @@ CREATE TABLE IF NOT EXISTS results (
 CREATE INDEX IF NOT EXISTS idx_results_template_id
     ON results(template_id);
 """
+
+# 早期版本的 results 表没有 bind_json 列；对既有数据库文件幂等补列，
+# 旧记录该列为 NULL（无绑定），读取与重算核对按无绑定处理，完全兼容。
+_EXTRA_COLUMNS = {
+    "results": ("bind_json", "TEXT"),
+}
 
 # 进程内 init 串行化：同一进程内多个连接（如测试、多 worker）同时初始化时，
 # fcntl 对同进程的不同文件描述符不互斥，必须再配一把线程锁。
@@ -174,6 +181,7 @@ def init_db(db_path: str | None = None) -> None:
             try:
                 conn = _connect(path, set_wal=True)
                 conn.executescript(_SCHEMA)
+                _apply_column_migrations(conn)
                 return
             except sqlite3.OperationalError as exc:
                 last_error = exc
@@ -194,6 +202,21 @@ def init_db(db_path: str | None = None) -> None:
 
 def new_id() -> str:
     return uuid.uuid4().hex
+
+
+def _apply_column_migrations(conn: sqlite3.Connection) -> None:
+    """对既有库文件幂等补列（CREATE TABLE IF NOT EXISTS 不会改动旧表）。
+
+    在 init 的排他通道内执行；缺列才 ADD，已有列则原样保留。
+    """
+    for table, (column, column_type) in _EXTRA_COLUMNS.items():
+        existing = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in existing:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def _is_busy_error(exc: sqlite3.Error) -> bool:
@@ -270,20 +293,25 @@ def get_template(template_id: str, db_path: str | None = None):
 
 
 def insert_result(template_id: str, delay: dict, times: dict,
-                  db_path: str | None = None) -> tuple[str, str]:
+                  db_path: str | None = None, bind=None) -> tuple[str, str]:
     """插入一次成功推演的结果，返回 (结果 ID, 创建时间)。
+
+    ``bind`` 为规范化后的点 ID 二元组（无绑定时 ``None``），作为输入的
+    一部分冻结入库；读取时用模板 + delay + 绑定重算核对。
 
     创建时间在拿写锁前一刻生成一次并显式写列；返回值与列值为同一字符串。
     """
     path = db_path or resolve_db_path()
     result_id = new_id()
     created_at = utc_now()
+    bind_value = list(bind) if bind else None
     _write(
         path,
-        "INSERT INTO results (id, template_id, delay_json, times_json, "
-        "created_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO results (id, template_id, delay_json, bind_json, "
+        "times_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (result_id, template_id,
          json.dumps(delay, ensure_ascii=False, sort_keys=True),
+         json.dumps(bind_value, ensure_ascii=False),
          json.dumps(times, ensure_ascii=False, sort_keys=True),
          created_at),
     )
@@ -295,18 +323,20 @@ def get_result(result_id: str, db_path: str | None = None):
     conn = _connect(path)
     try:
         row = conn.execute(
-            "SELECT template_id, delay_json, times_json, created_at "
-            "FROM results WHERE id = ?",
+            "SELECT template_id, delay_json, bind_json, times_json, "
+            "created_at FROM results WHERE id = ?",
             (result_id,),
         ).fetchone()
     finally:
         conn.close()
     if row is None:
         return None
+    stored_bind = json.loads(row["bind_json"]) if row["bind_json"] else None
     return {
         "id": result_id,
         "template_id": row["template_id"],
         "delay": json.loads(row["delay_json"]),
+        "bind": tuple(stored_bind) if stored_bind else None,
         "times": json.loads(row["times_json"]),
         "created_at": row["created_at"],
     }

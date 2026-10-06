@@ -1,6 +1,7 @@
 """模板与延误推演请求的输入校验，并产出规范化（canonical）表示。
 
-规范化规则：提示点按 ID 升序保存；关系按 (from, to, min_gap) 升序保存。
+规范化规则：提示点按 ID 升序保存；关系按 (from, to, min_gap) 升序保存；
+推演时的同刻绑定规范化为按点 ID 升序的二元组（输入两点次序任意）。
 推演算法本身对顺序不敏感，规范化只是让同一批规则落库内容一致、便于核对。
 """
 
@@ -184,13 +185,18 @@ def validate_template(payload):
     return {"points": points, "relations": relations}
 
 
-def validate_delay(payload, canonical_template):
-    """校验推演请求中的 delay 覆盖，返回规范化后的 delay dict。"""
+def validate_derivation(payload, canonical_template):
+    """校验推演请求中的 delay 覆盖与同刻绑定。
+
+    返回规范化后的 ``(delay, bind)``：``delay`` 为 ``{点 ID: int}``；
+    ``bind`` 为按点 ID 升序的二元组（如 ``("a", "c")``），未传绑定时为
+    ``None``。绑定两点的输入次序不影响规范化结果。
+    """
     if not isinstance(payload, dict):
-        raise AppError(INVALID_DELAY, "Delay override must be a JSON object.",
+        raise AppError(INVALID_DELAY, "Derivation request must be a JSON object.",
                        status_code=400)
 
-    allowed_top = {"template_id", "delay", "explain"}
+    allowed_top = {"template_id", "delay", "explain", "bind"}
     extra = set(payload) - allowed_top
     if extra:
         raise AppError(
@@ -236,4 +242,36 @@ def validate_delay(payload, canonical_template):
                          "delay": value})
         delay[key] = value
 
-    return delay
+    bind = None
+    if "bind" in payload:
+        raw_bind = payload["bind"]
+        # 必须是恰好两个不同点 ID 的数组；两点输入次序任意，输出统一规范化。
+        if not isinstance(raw_bind, list) or len(raw_bind) != 2:
+            raise AppError(
+                INVALID_DELAY,
+                "Field 'bind' must be an array of exactly two point ids.",
+                status_code=400, details={"path": "bind"})
+        bind_ids = []
+        for index, point_id in enumerate(raw_bind):
+            if not _is_non_empty_str(point_id):
+                raise AppError(
+                    INVALID_DELAY,
+                    f"bind[{index}] must be a non-empty string.",
+                    status_code=400,
+                    details={"path": f"bind[{index}]"})
+            if point_id not in release_by_id:
+                raise AppError(
+                    INVALID_DELAY,
+                    f"bind[{index}] references unknown point id {point_id!r}.",
+                    status_code=400,
+                    details={"path": f"bind[{index}]", "id": point_id})
+            bind_ids.append(point_id)
+        if bind_ids[0] == bind_ids[1]:
+            raise AppError(
+                INVALID_DELAY,
+                "Field 'bind' must reference two different point ids.",
+                status_code=400,
+                details={"path": "bind", "id": bind_ids[0]})
+        bind = tuple(sorted(bind_ids))
+
+    return delay, bind

@@ -15,13 +15,22 @@
   （正权环 => 时刻可沿环无限增长），返回 ``positive_cycle``；
 * 否则结果即同时满足全部下界的最早时刻，再逐点检查 ``latest`` 上界。
 
+可选的"同刻绑定"（两个**不同**提示点 x、y 必须同一时刻播发）就是在图上
+**同时**加入两条零间隔边 ``x -> y`` 与 ``y -> x``：``t[x] >= t[y]`` 与
+``t[y] >= t[x]``。它与普通关系一样参与松弛，因此延误既会沿绑定**回传**
+（较晚的点把较早的点抬起），又会从被抬起的点沿既有关系**再次传播**——
+绝不能先算无绑定的旧表、再把两个时刻改成同一个数字，那会漏掉回传之后的
+二次传播。若原关系在两点之间任一方向上存在**正间隔**路径，该路径与反向
+零边组成正权环，仍按既有优先级报 ``positive_cycle``。
+
 因果解释（可选）
 ----------------
 
 无正权环时，每个点的最早时刻都可由一条**证据链**精确复现：从某点的基础
-下界（原始 release 或本次 delay）出发，沿**实际取紧**的关系
-（``times[to] == times[from] + min_gap``）走到目标点，逐边 min_gap 相加
-恰好等于目标点的最早时刻。证据链唯一，与规则录入顺序无关：
+下界（原始 release 或本次 delay）出发，沿**实际取紧**的关系或同刻绑定边
+（``times[to] == times[from] + min_gap``；绑定边 ``min_gap == 0`` 且带
+``binding: true`` 标记，是可辨认的零间隔边）走到目标点，逐边 min_gap
+相加恰好等于目标点的最早时刻。证据链唯一，与规则录入顺序无关：
 
 * 等价链先取**关系数最少**者；
 * 再按**完整点 ID 序列的 UTF-8 字节序**取最小者（逐元素比较）。
@@ -49,13 +58,42 @@ STATUS_DEADLINE_EXCEEDED = "deadline_exceeded"
 STATUS_INCONSISTENT = "inconsistent"
 
 
-def _compute_outcome(points, relations, delay):
+def normalize_bind(bind):
+    """把同刻绑定规范化为按 ID 升序的二元组；无绑定时为 ``None``。
+
+    无论输入两点的次序（``["y","x"]`` 还是 ``["x","y"]``），规范化结果都
+    相同，因此冻结与重算核对不受录入次序影响。调用前应已通过校验层确认
+    这是两个存在且互不相同的点 ID。
+    """
+    if not bind:
+        return None
+    first, second = bind
+    return (first, second) if first <= second else (second, first)
+
+
+def _build_edges(relations, bind):
+    """构造松弛边表。
+
+    普通关系为 ``(u, v, gap, False)``；同刻绑定展开成两条
+    ``(u, v, 0, True)`` 零间隔边（正反各一条）。末尾的布尔位表示该边
+    是否为绑定边，供因果解释渲染可辨认的零间隔边。
+    """
+    edges = [(r["from"], r["to"], r["min_gap"], False) for r in relations]
+    if bind:
+        first, second = bind
+        edges.append((first, second, 0, True))
+        edges.append((second, first, 0, True))
+    return edges
+
+
+def _compute_outcome(points, relations, delay, bind=None):
     """核心松弛：返回 ``(status, times, violations)``。
 
     ``times`` 在 ``positive_cycle`` 时为 ``None``（时刻无有限值）；
     ``violations`` 仅在 ``deadline_exceeded`` 时非 ``None``。
     """
     delay = delay or {}
+    bind = normalize_bind(bind)
     ids = [p["id"] for p in points]
     n = len(ids)
 
@@ -67,13 +105,14 @@ def _compute_outcome(points, relations, delay):
 
     latest_by_id = {p["id"]: p.get("latest") for p in points}
 
-    # 边以 (u, v, gap) 表示 t[v] >= t[u] + gap。
-    edges = [(r["from"], r["to"], r["min_gap"]) for r in relations]
+    # 边以 (u, v, gap, is_binding) 表示 t[v] >= t[u] + gap；同刻绑定是
+    # 两条相向的零间隔边，与普通关系一起松弛，回传与二次传播自动发生。
+    edges = _build_edges(relations, bind)
 
     # 至多 n 轮松弛即可得到无正权环图上的最长路。
     for _ in range(n):
         changed = False
-        for u, v, gap in edges:
+        for u, v, gap, _is_binding in edges:
             candidate = times[u] + gap
             if candidate > times[v]:
                 times[v] = candidate
@@ -82,7 +121,7 @@ def _compute_outcome(points, relations, delay):
             break
 
     # 第 n+1 轮检测：仍能松弛 => 存在总权为正的有向环。
-    for u, v, gap in edges:
+    for u, v, gap, _is_binding in edges:
         if times[u] + gap > times[v]:
             return STATUS_POSITIVE_CYCLE, None, None
 
@@ -100,7 +139,7 @@ def _compute_outcome(points, relations, delay):
     return STATUS_OK, times, None
 
 
-def earliest_schedule(points, relations, delay=None):
+def earliest_schedule(points, relations, delay=None, bind=None):
     """求逐点最早可执行时刻。
 
     :param points: 已校验的提示点列表，元素为
@@ -108,12 +147,15 @@ def earliest_schedule(points, relations, delay=None):
     :param relations: 已校验的关系列表，元素为
         ``{"from": str, "to": str, "min_gap": int}``。
     :param delay: 可选的 ``{点 ID: 延误覆盖值}``，覆盖值不小于原 release。
+    :param bind: 可选的同刻绑定——两个**不同**且存在的点 ID（传入顺序
+        任意，内部规范化为 ID 升序），要求两点最早时刻相等。
     :returns:
         成功::
 
             {"status": "ok", "times": {id: int, ...}}  # 含全部提示点
 
-        存在总间隔为正的有向环::
+        存在总间隔为正的有向环（含原关系在绑定两点间形成正间隔路径、
+        与绑定零边合环）::
 
             {"status": "positive_cycle"}
 
@@ -122,7 +164,7 @@ def earliest_schedule(points, relations, delay=None):
             {"status": "deadline_exceeded",
              "violations": [{"id": str, "earliest": int, "latest": int}, ...]}
     """
-    status, times, violations = _compute_outcome(points, relations, delay)
+    status, times, violations = _compute_outcome(points, relations, delay, bind)
     if status == STATUS_POSITIVE_CYCLE:
         return {"status": STATUS_POSITIVE_CYCLE}
     if status == STATUS_DEADLINE_EXCEEDED:
@@ -130,7 +172,7 @@ def earliest_schedule(points, relations, delay=None):
     return {"status": STATUS_OK, "times": times}
 
 
-def _best_evidence(points, relations, delay, times):
+def _best_evidence(points, relations, delay, times, bind=None):
     """为每个点构造唯一最佳证据链（契约见模块 docstring）。
 
     ``times`` 必须是无正权环时 :func:`_compute_outcome` 给出的不动点。
@@ -138,6 +180,7 @@ def _best_evidence(points, relations, delay, times):
     （无正权环时数学上不会发生，仅作防御）返回 ``None``。
     """
     delay = delay or {}
+    bind = normalize_bind(bind)
 
     # 每个点的基础下界及其来源（release 或本次 delay）。
     base = {}
@@ -148,17 +191,37 @@ def _best_evidence(points, relations, delay, times):
         else:
             base[pid] = ("release", p["release"])
 
-    # 实际取紧的边：times[u] + gap == times[v]。
+    # 实际取紧的边：times[u] + gap == times[v]。同刻绑定的两条零边同样
+    # 取紧，但渲染时带 binding 标记，是证据里可辨认的零间隔边。
     tight = {}
+
+    def _add_tight(u, v, gap, is_binding):
+        if times[u] + gap != times[v]:
+            return
+        entries = tight.setdefault(u, [])
+        for index, (existing_v, _gap, existing_binding) in enumerate(entries):
+            if existing_v != v:
+                continue
+            # 同一 (u,v) 上并列的取紧零边只留一条，让裁决与录入无关：
+            # 绑定边优先于普通关系；同为普通关系时保留先出现的一条。
+            if is_binding and not existing_binding:
+                entries[index] = (v, gap, True)
+            return
+        entries.append((v, gap, is_binding))
+
     for r in relations:
-        u, v, gap = r["from"], r["to"], r["min_gap"]
-        if times[u] + gap == times[v]:
-            tight.setdefault(u, []).append((v, gap))
+        _add_tight(r["from"], r["to"], r["min_gap"], False)
+    if bind:
+        first, second = bind
+        _add_tight(first, second, 0, True)
+        _add_tight(second, first, 0, True)
 
     # Dijkstra：键为 (关系数, 完整点 ID 序列的 UTF-8 字节序)。键沿边严格
     # 增大（关系数 +1），每个点只结算一次；零权环上的取紧边因此不会
     # 让追溯循环——含环的链关系数更多，必然落选。
-    # best[pid] = (关系数, 路径字节序, 路径点 ID 元组, 边三元组元组)
+    # best[pid] = (关系数, 路径字节序, 路径点 ID 元组, 边四元组元组)
+    # 绑定的零间隔边同样算作一条边参与计数——键沿任意边都严格 +1，因此
+    # 绑定与零权关系组成的零环同样关系数更多而落选，追溯不会循环。
     best = {}
     heap = []
     for p in points:
@@ -179,13 +242,13 @@ def _best_evidence(points, relations, delay, times):
         settled.add(pid)
         path_ids = current[2]
         chain_edges = current[3]
-        for nxt, gap in tight.get(pid, ()):
+        for nxt, gap, is_binding in tight.get(pid, ()):
             if nxt in settled:
                 continue
             candidate = (count + 1,
                          path_bytes + (nxt.encode("utf-8"),),
                          path_ids + (nxt,),
-                         chain_edges + ((pid, nxt, gap),))
+                         chain_edges + ((pid, nxt, gap, is_binding),))
             existing = best.get(nxt)
             if existing is None or candidate[:2] < existing[:2]:
                 best[nxt] = candidate
@@ -196,22 +259,29 @@ def _best_evidence(points, relations, delay, times):
 
     explanations = {}
     for pid in sorted(best):
-        _, _, path_ids, edge_triples = best[pid]
+        _, _, path_ids, edge_quads = best[pid]
         kind, value = base[path_ids[0]]
+        rendered_edges = []
+        for u, v, edge_gap, is_binding in edge_quads:
+            edge = {"from": u, "to": v, "min_gap": edge_gap}
+            if is_binding:
+                # 可辨认的同刻零间隔边。
+                edge["binding"] = True
+            rendered_edges.append(edge)
         explanations[pid] = {
             "target": pid,
             "time": times[pid],
             "start": {"id": path_ids[0], "kind": kind, "value": value},
-            "edges": [{"from": u, "to": v, "min_gap": gap}
-                      for u, v, gap in edge_triples],
+            "edges": rendered_edges,
             "path": list(path_ids),
         }
     return explanations
 
 
-def explain_schedule(points, relations, delay=None):
+def explain_schedule(points, relations, delay=None, bind=None):
     """推演并给出因果解释。
 
+    :param bind: 可选的同刻绑定（两个不同点 ID，次序任意）。
     :returns:
         成功::
 
@@ -228,11 +298,11 @@ def explain_schedule(points, relations, delay=None):
             {"status": "positive_cycle"}
     """
     delay = delay or {}
-    status, times, violations = _compute_outcome(points, relations, delay)
+    status, times, violations = _compute_outcome(points, relations, delay, bind)
     if status == STATUS_POSITIVE_CYCLE:
         return {"status": STATUS_POSITIVE_CYCLE}
 
-    explanations = _best_evidence(points, relations, delay, times)
+    explanations = _best_evidence(points, relations, delay, times, bind)
     assert explanations is not None  # 无正权环时每个点都有证据链
 
     if status == STATUS_DEADLINE_EXCEEDED:
@@ -247,8 +317,9 @@ def explain_schedule(points, relations, delay=None):
             "explanations": explanations}
 
 
-def verify_result_explanations(points, relations, delay, stored_times):
-    """用冻结模板与 delay 重算，核对已保存结果并给出解释。
+def verify_result_explanations(points, relations, delay, stored_times,
+                               bind=None):
+    """用冻结模板、delay 与同刻绑定重算，核对已保存结果并给出解释。
 
     * 重算成功、逐点时刻与保存值完全一致、且每条证据逐边相加等于保存的
       最早时刻:: ``{"status": "ok", "explanations": {...}}``
@@ -258,15 +329,16 @@ def verify_result_explanations(points, relations, delay, stored_times):
     本函数只读不改写：不一致时由调用方报错，记录保持原样。
     """
     delay = delay or {}
+    bind = normalize_bind(bind)
     try:
-        status, times, _ = _compute_outcome(points, relations, delay)
+        status, times, _ = _compute_outcome(points, relations, delay, bind)
     except (KeyError, TypeError, ValueError):
         # 冻结输入本身已损坏（如模板被外部改写），同样视为不一致。
         return {"status": STATUS_INCONSISTENT}
     if status != STATUS_OK or times != stored_times:
         return {"status": STATUS_INCONSISTENT}
 
-    explanations = _best_evidence(points, relations, delay, times)
+    explanations = _best_evidence(points, relations, delay, times, bind)
     if explanations is None:
         return {"status": STATUS_INCONSISTENT}
 
